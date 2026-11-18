@@ -6,9 +6,7 @@ import CoreLocation
 
 /// Runs idevice's iOS 27+ pairable-host flow on-device.
 ///
-/// Advertising uses Network.framework NWListener (Bonjour). Inbound TCP is
-/// relayed to the Rust pairable-host on loopback. The 6-digit PIN is created
-/// only after that connection + pair-setup handshake.
+/// Bonjour discovery uses iOS's system service. Native pair-setup runs on its own serial executor.
 @MainActor
 final class PairOnDeviceService: ObservableObject {
     enum Phase: Equatable {
@@ -22,10 +20,10 @@ final class PairOnDeviceService: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var pin: String?
-    @Published private(set) var debugPort: UInt16?
 
-    private var worker: Thread?
-    private let callbackBox = PairCallbackBox()
+    private static let pinNotificationID = "locus.pairing.pin"
+    private var worker: PairingWorker?
+    private var socket: PairingSocket?
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
     private let keepAlive = PairingKeepAlive()
     private let audioKeepAlive = SilentAudioKeepAlive()
@@ -40,31 +38,53 @@ final class PairOnDeviceService: ObservableObject {
 
     func start(pairingStore: PairingStore) {
         guard !isBusy else { return }
+        Self.clearPINNotification()
         phase = .advertising
         pin = nil
-        debugPort = nil
-        callbackBox.owner = self
-
+        let worker = PairingWorker()
+        self.worker = worker
         requestNotificationPermission()
         beginKeepAlive()
 
-        _ = pairingStore.pairingURL
-        try? FileManager.default.createDirectory(
-            at: pairingStore.pairingURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-
-        let outputPath = pairingStore.pairingURL.path
-        let box = callbackBox
-
-        worker = Thread {
-            autoreleasepool {
-                Self.runBlockingAccept(outputPath: outputPath, box: box)
+        let revision = pairingStore.revision
+        Task { [self] in
+            do {
+                let info = try await worker.prepare()
+                guard self.worker === worker else { return }
+                try advertiser.publish(service: info.name, records: info.records) { [weak self] socket in
+                    guard let self, self.worker === worker else { return }
+                    self.accept(socket, worker: worker, pairingStore: pairingStore, revision: revision)
+                } onFailure: { [weak self] message in
+                    guard let self, self.worker === worker else { return }
+                    self.handleFailure(message)
+                }
+            } catch {
+                guard self.worker === worker else { return }
+                handleFailure(error.localizedDescription)
             }
         }
-        worker?.name = "locus.pairable-host"
-        worker?.qualityOfService = .userInitiated
-        worker?.start()
+    }
+
+    private func accept(_ socket: PairingSocket, worker: PairingWorker, pairingStore: PairingStore, revision: UUID) {
+        self.socket = socket
+        handleConnected()
+        Task { [self] in
+            do {
+                let data = try await worker.pair(socket) { [weak self] value in
+                    guard let self, self.worker === worker else { return }
+                    self.handlePIN(value)
+                }
+                guard self.worker === worker else { return }
+                guard pairingStore.revision == revision else {
+                    throw PairingFailure("The pairing file changed while pairing was in progress.")
+                }
+                try pairingStore.installPairingData(data)
+                handleSuccess()
+            } catch {
+                guard self.worker === worker else { return }
+                handleFailure(error.localizedDescription)
+            }
+        }
     }
 
     func acknowledgeFailure() {
@@ -76,36 +96,14 @@ final class PairOnDeviceService: ObservableObject {
     }
 
     func resetToIdle() {
+        if isBusy { NSLog("[Locus pairing] Canceled from pairing UI") }
         teardown()
         phase = .idle
         pin = nil
-        debugPort = nil
     }
 
-    fileprivate func handleListening(
-        port: UInt16,
-        serviceIdentifier: String,
-        name: String,
-        model: String,
-        authTag: String,
-        ver: String,
-        minVer: String
-    ) {
-        debugPort = port
-        advertiser.publish(
-            port: port,
-            serviceIdentifier: serviceIdentifier,
-            name: name,
-            model: model,
-            authTag: authTag,
-            ver: ver,
-            minVer: minVer
-        )
-        phase = .advertising
-        NSLog("[Locus] listening on %u, Bonjour id=%@", port, serviceIdentifier)
-    }
-
-    fileprivate func handleConnected() {
+    private func handleConnected() {
+        NSLog("[Locus pairing] TCP accepted")
         phase = .deviceConnected
         Self.postPlainNotification(
             title: "Locus connected",
@@ -113,31 +111,37 @@ final class PairOnDeviceService: ObservableObject {
         )
     }
 
-    fileprivate func handlePIN(_ value: String) {
+    private func handlePIN(_ value: String) {
+        NSLog("[Locus pairing] PIN available")
         pin = value
         phase = .awaitingPIN(value)
         Self.postPINNotification(value)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
-    fileprivate func handleSuccess() {
+    private func handleSuccess() {
         pin = nil
         phase = .succeeded
         teardown()
         Self.postPlainNotification(
             title: "Locus paired",
-            body: "RPPairing is ready. Connect LocalDevVPN, then teleport."
+            body: String(localized: "Pairing is complete. Open Locus to start simulating your location.")
         )
     }
 
-    fileprivate func handleFailure(_ message: String) {
+    private func handleFailure(_ message: String) {
         pin = nil
         phase = .failed(message)
         teardown()
     }
 
     private func teardown() {
+        guard worker != nil else { return }
+        worker = nil
+        Self.clearPINNotification()
         advertiser.stop()
+        socket?.interrupt()
+        socket = nil
         endKeepAlive()
     }
 
@@ -145,9 +149,10 @@ final class PairOnDeviceService: ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = true
         keepAlive.start()
         audioKeepAlive.start()
-        guard backgroundTask == .invalid else { return }
-        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "locus.pairable-host") { [weak self] in
-            self?.endKeepAlive()
+        guard backgroundTask == .invalid, let worker else { return }
+        backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "locus.pairable-host") { [weak self, weak worker] in
+            guard let self, let worker, self.worker === worker else { return }
+            self.endKeepAlive()
         }
     }
 
@@ -164,15 +169,19 @@ final class PairOnDeviceService: ObservableObject {
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
+    private static func clearPINNotification() {
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [pinNotificationID])
+        center.removeDeliveredNotifications(withIdentifiers: [pinNotificationID])
+    }
+
     private static func postPINNotification(_ pin: String) {
         let content = UNMutableNotificationContent()
         content.title = "Locus pairing code"
         content.body = pin
         content.sound = .default
-        if #available(iOS 15.0, *) {
-            content.interruptionLevel = .timeSensitive
-        }
-        let request = UNNotificationRequest(identifier: "locus.pairing.pin", content: content, trigger: nil)
+        content.interruptionLevel = .timeSensitive
+        let request = UNNotificationRequest(identifier: pinNotificationID, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
 
@@ -185,75 +194,6 @@ final class PairOnDeviceService: ObservableObject {
         UNUserNotificationCenter.current().add(request)
     }
 
-    private static func runBlockingAccept(outputPath: String, box: PairCallbackBox) {
-        let name = "Locus"
-        let model = "Mac17,7"
-
-        var outFile: OpaquePointer?
-        var altIRK = [UInt8](repeating: 0, count: 16)
-
-        let err: UnsafeMutablePointer<IdeviceFfiError>? = name.withCString { namePtr in
-            model.withCString { modelPtr in
-                pairable_host_accept(
-                    namePtr,
-                    modelPtr,
-                    0,
-                    pinDisplayTrampoline,
-                    Unmanaged.passUnretained(box).toOpaque(),
-                    listeningTrampoline,
-                    Unmanaged.passUnretained(box).toOpaque(),
-                    connectedTrampoline,
-                    Unmanaged.passUnretained(box).toOpaque(),
-                    &altIRK,
-                    &outFile
-                )
-            }
-        }
-
-        if let err {
-            let message: String
-            if let cMessage = err.pointee.message {
-                message = String(cString: cMessage)
-            } else {
-                message = "Unknown pairing error (\(err.pointee.code))"
-            }
-            idevice_error_free(err)
-            DispatchQueue.main.async { box.owner?.handleFailure(message) }
-            return
-        }
-
-        guard let outFile else {
-            DispatchQueue.main.async {
-                box.owner?.handleFailure("Pairing finished but no pairing file was returned.")
-            }
-            return
-        }
-
-        defer { rp_pairing_file_free(outFile) }
-
-        let parent = (outputPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-
-        let writeError = outputPath.withCString { path in
-            rp_pairing_file_write(outFile, path)
-        }
-        if let writeError {
-            let message: String
-            if let cMessage = writeError.pointee.message {
-                message = String(cString: cMessage)
-            } else {
-                message = "Failed to write pairing file"
-            }
-            idevice_error_free(writeError)
-            DispatchQueue.main.async {
-                box.owner?.handleFailure("Paired, but failed to save file: \(message)")
-            }
-            return
-        }
-
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputPath)
-        DispatchQueue.main.async { box.owner?.handleSuccess() }
-    }
 }
 
 private final class PairingKeepAlive: NSObject, CLLocationManagerDelegate {
@@ -278,54 +218,84 @@ private final class PairingKeepAlive: NSObject, CLLocationManagerDelegate {
     }
 }
 
-final class PairCallbackBox: @unchecked Sendable {
-    weak var owner: PairOnDeviceService?
-}
+private struct PairingFailure: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
 
-private func pinDisplayTrampoline(pin: UnsafePointer<CChar>?, context: UnsafeMutableRawPointer?) {
-    guard let pin, let context else { return }
-    let value = String(cString: pin)
-    let box = Unmanaged<PairCallbackBox>.fromOpaque(context).takeUnretainedValue()
-    DispatchQueue.main.async { box.owner?.handlePIN(value) }
-}
-
-private func listeningTrampoline(
-    port: UInt16,
-    serviceIdentifier: UnsafePointer<CChar>?,
-    name: UnsafePointer<CChar>?,
-    model: UnsafePointer<CChar>?,
-    authTag: UnsafePointer<CChar>?,
-    ver: UnsafePointer<CChar>?,
-    minVer: UnsafePointer<CChar>?,
-    context: UnsafeMutableRawPointer?
-) {
-    guard let context else { return }
-    let box = Unmanaged<PairCallbackBox>.fromOpaque(context).takeUnretainedValue()
-    let values = (
-        port,
-        serviceIdentifier.map { String(cString: $0) } ?? "",
-        name.map { String(cString: $0) } ?? "Locus",
-        model.map { String(cString: $0) } ?? "Mac17,7",
-        authTag.map { String(cString: $0) } ?? "",
-        ver.map { String(cString: $0) } ?? "26",
-        minVer.map { String(cString: $0) } ?? "17"
-    )
-    // NetService must be touched on the main thread / runloop.
-    DispatchQueue.main.async {
-        box.owner?.handleListening(
-            port: values.0,
-            serviceIdentifier: values.1,
-            name: values.2,
-            model: values.3,
-            authTag: values.4,
-            ver: values.5,
-            minVer: values.6
-        )
+    static func check(_ error: UnsafeMutablePointer<IdeviceFfiError>?) throws {
+        guard let error else { return }
+        defer { idevice_error_free(error) }
+        throw Self(error.pointee.message.map { String(cString: $0) } ?? "Pairing error (\(error.pointee.code)).")
     }
 }
 
-private func connectedTrampoline(context: UnsafeMutableRawPointer?) {
-    guard let context else { return }
-    let box = Unmanaged<PairCallbackBox>.fromOpaque(context).takeUnretainedValue()
-    DispatchQueue.main.async { box.owner?.handleConnected() }
+private final class PairingIdentity {
+    let handle: OpaquePointer
+    init(_ handle: OpaquePointer) { self.handle = handle }
+    deinit { pairable_host_free(handle) }
+}
+
+private final class PINCallback: Sendable {
+    let display: @MainActor @Sendable (String) -> Void
+    init(_ display: @escaping @MainActor @Sendable (String) -> Void) { self.display = display }
+}
+
+private actor PairingWorker {
+    struct Service: Sendable {
+        let name: String
+        let records: [String: String]
+    }
+
+    private static let queue = DispatchSerialQueue(label: "locus.pairable-host", qos: .userInitiated)
+    nonisolated var unownedExecutor: UnownedSerialExecutor { Self.queue.asUnownedSerialExecutor() }
+    private var identity: PairingIdentity?
+
+    func prepare() throws -> Service {
+        var handle: OpaquePointer?
+        var name: UnsafeMutablePointer<CChar>?
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var count: UInt = 0
+        // A fresh random PIN is required for every new pairing attempt.
+        try PairingFailure.check(pairable_host_prepare("Locus", "Mac17,7", false, &handle, &name, &bytes, &count, nil))
+        defer {
+            if let name { idevice_string_free(name) }
+            if let bytes { idevice_data_free(bytes, count) }
+        }
+        guard let handle else { throw PairingFailure("No pairing identity was returned.") }
+        identity = PairingIdentity(handle)
+        guard let name, let bytes,
+              let records = try PropertyListSerialization.propertyList(
+                from: Data(bytes: bytes, count: Int(count)), format: nil
+              ) as? [String: String] else { throw PairingFailure("Invalid Bonjour pairing information.") }
+        return Service(name: String(cString: name), records: records)
+    }
+
+    func pair(_ socket: PairingSocket, onPIN: @escaping @MainActor @Sendable (String) -> Void) throws -> Data {
+        guard let identity else { throw PairingFailure("No pairing identity was prepared.") }
+        let callback = PINCallback(onPIN)
+        var file: OpaquePointer?
+        let error = withExtendedLifetime((socket, callback)) {
+            pairable_host_accept_fd(identity.handle, socket.descriptor, { pin, ctx in
+                guard let pin, let ctx else { return }
+                let value = String(cString: pin)
+                let callback = Unmanaged<PINCallback>.fromOpaque(ctx).takeUnretainedValue()
+                DispatchQueue.main.async { callback.display(value) }
+            }, Unmanaged.passUnretained(callback).toOpaque(), nil, &file)
+        }
+        if let error {
+            NSLog("[Locus pairing] Native handshake failed (code %d)", error.pointee.code)
+            try PairingFailure.check(error)
+        }
+        NSLog("[Locus pairing] Native handshake completed")
+        guard let file else { throw PairingFailure("Pairing finished but no pairing file was returned.") }
+        defer { rp_pairing_file_free(file) }
+
+        var bytes: UnsafeMutablePointer<UInt8>?
+        var count: UInt = 0
+        try PairingFailure.check(rp_pairing_file_to_bytes(file, &bytes, &count))
+        guard let bytes else { throw PairingFailure("The pairing file is empty.") }
+        defer { idevice_data_free(bytes, count) }
+        return Data(bytes: bytes, count: Int(count))
+    }
 }

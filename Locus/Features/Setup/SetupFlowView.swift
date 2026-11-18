@@ -1,7 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// First-run walkthrough: welcome → pairing → LocalDevVPN → map.
+/// First-run walkthrough: welcome → pairing → local VPN → map.
 /// Skipped when `SetupGate.isComplete` (see `LocusApp`).
 struct SetupFlowView: View {
     @EnvironmentObject private var pairing: PairingStore
@@ -12,8 +12,7 @@ struct SetupFlowView: View {
     @State private var step: Step
     @State private var appear = false
     @State private var showImporter = false
-    @State private var localDevVPNInstalled = LocalDevVPN.isInstalled
-    @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var vpn: LocusVPN
 
     enum Step: Int, CaseIterable {
         case welcome
@@ -63,17 +62,6 @@ struct SetupFlowView: View {
         .animation(.spring(response: 0.45, dampingFraction: 0.86), value: step)
         .onAppear {
             withAnimation(.easeOut(duration: 0.7)) { appear = true }
-            localDevVPNInstalled = LocalDevVPN.isInstalled
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                localDevVPNInstalled = LocalDevVPN.isInstalled
-            }
-        }
-        .onChange(of: step) { _, newStep in
-            if newStep == .vpn {
-                localDevVPNInstalled = LocalDevVPN.isInstalled
-            }
         }
         .onChange(of: pairing.hasPairingFile) { _, hasFile in
             if hasFile, step == .welcome || step == .pairing {
@@ -186,7 +174,7 @@ struct SetupFlowView: View {
                         .font(.system(size: 48, weight: .bold, design: .rounded))
                         .tracking(-0.5)
 
-                    Text("Teleport your location.\nNo computer required.")
+                    Text("Simulate your iPhone’s location.")
                         .font(.title3)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -200,10 +188,6 @@ struct SetupFlowView: View {
             Spacer()
 
             VStack(spacing: 14) {
-                Text("A short setup — about two minutes.")
-                    .font(.subheadline)
-                    .foregroundStyle(.tertiary)
-
                 primaryButton("Get started") {
                     SetupGate.markInProgress()
                     withAnimation { step = .pairing }
@@ -272,16 +256,16 @@ struct SetupFlowView: View {
 
     private var importPairingCard: some View {
         VStack(alignment: .leading, spacing: 14) {
-            stepRow(1, "On a Mac, run idevice_pair and create an RPPairing file.")
-            stepRow(2, "AirDrop / Share into Locus, or copy the plist text.")
-            stepRow(3, "Tap Import, or Paste from clipboard if the picker doesn’t work (LiveContainer).")
+            stepRow(1, "On your computer, use idevice_pair to create an RPPairing file for this iPhone.")
+            stepRow(2, "Transfer the file to this iPhone, or copy the plist text.")
+            stepRow(3, "Choose Import pairing file or Paste from clipboard.")
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
     }
 
-    private func stepRow(_ n: Int, _ text: String) -> some View {
+    private func stepRow(_ n: Int, _ text: LocalizedStringKey) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Text("\(n)")
                 .font(.caption.weight(.bold))
@@ -295,107 +279,62 @@ struct SetupFlowView: View {
         }
     }
 
-    // MARK: - LocalDevVPN
+    // MARK: - Local VPN
 
     private var vpnPage: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 20)
-
-            VStack(spacing: 22) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 56, weight: .light))
-                    .foregroundStyle(LocusTheme.accent)
-
-                VStack(spacing: 10) {
-                    Text(localDevVPNInstalled ? "Connect LocalDevVPN" : "One more app")
-                        .font(.title.weight(.bold))
-
-                    Text(localDevVPNInstalled
-                         ? "LocalDevVPN is installed. Open it to turn on the private tunnel Locus needs, then come back here."
-                         : "LocalDevVPN creates a private tunnel Locus uses to talk to your phone’s location system. Install it, turn it on, then you’re ready to teleport.")
-                        .font(.body)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 12) {
-                    if localDevVPNInstalled {
-                        tipRow(systemImage: "checkmark.circle.fill", title: "Installed", detail: "LocalDevVPN is on this iPhone.")
-                        tipRow(systemImage: "power.circle.fill", title: "Connect", detail: "Tap below to open it and start the tunnel. You’ll bounce back to Locus.")
-                    } else {
-                        tipRow(systemImage: "arrow.down.app.fill", title: "Install", detail: "Get LocalDevVPN from the App Store.")
-                        tipRow(systemImage: "power.circle.fill", title: "Connect", detail: "Open it and turn the VPN on. Leave the default IP alone.")
-                    }
-                    tipRow(systemImage: "wifi", title: "First teleport on Wi‑Fi", detail: "Start your first teleport while on Wi‑Fi. After that, it can keep working on cellular.")
-                }
-                .padding(18)
-                .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-            }
-            .padding(.horizontal, 24)
-
-            Spacer()
-
-            VStack(spacing: 12) {
-                Button {
-                    if localDevVPNInstalled {
-                        LocalDevVPN.openInstalled()
-                    } else {
-                        LocalDevVPN.openAppStore()
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: localDevVPNInstalled ? "lock.shield.fill" : "apple.logo")
-                        Text(localDevVPNInstalled ? "Open LocalDevVPN" : "Get LocalDevVPN")
-                            .fontWeight(.semibold)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .foregroundStyle(.primary)
-                    .locusGlass(.interactive, in: Capsule())
-                    .contentShape(Capsule())
-                }
-                .buttonStyle(.plain)
-
-                primaryButton("I’ve connected it — continue") {
-                    onFinished()
-                }
-            }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 28)
-        }
-    }
-
-    private func tipRow(systemImage: String, title: String, detail: String) -> some View {
-        HStack(alignment: .top, spacing: 14) {
-            Image(systemName: systemImage)
-                .font(.body.weight(.semibold))
+        VStack(spacing: 20) {
+            Spacer(minLength: 12)
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 56, weight: .light))
                 .foregroundStyle(LocusTheme.accent)
-                .frame(width: 28, height: 28)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+            Text("Connect the local VPN")
+                .font(.title.weight(.bold))
+            Text("Locus uses a local VPN to reach this iPhone’s developer services. The first time you connect, allow iOS to add the VPN configuration.")
+                .foregroundStyle(.secondary)
+            LabeledContent("Local VPN") {
+                Text(vpn.status.locusTitle)
+            }
+            .padding(16)
+            .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 20))
+            if let error = vpn.lastError {
+                Text(verbatim: error)
+                    .font(.footnote)
+                    .foregroundStyle(LocusTheme.statusWarn)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Text("Use Wi-Fi for your first teleport.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            if vpn.status == .connected {
+                primaryButton("Continue to map", action: onFinished)
+            } else {
+                VPNActionButton(action: vpn.connect) {
+                    primaryButtonLabel(vpn.status.locusCanConnect ? "Connect VPN" : vpn.status.locusTitle)
+                }
+                .disabled(!vpn.status.locusCanConnect)
             }
         }
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 24)
+        .padding(.bottom, 28)
     }
 
     // MARK: - Shared
 
-    private func primaryButton(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.headline)
-                .foregroundStyle(.black)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .background(Capsule().fill(LocusTheme.accent))
-                .contentShape(Capsule())
-        }
-        .buttonStyle(.plain)
+    private func primaryButton(_ title: LocalizedStringKey, action: @escaping () -> Void) -> some View {
+        Button(action: action) { primaryButtonLabel(title) }
+            .buttonStyle(.plain)
+    }
+
+    private func primaryButtonLabel(_ title: LocalizedStringKey) -> some View {
+        Text(title)
+            .font(.headline)
+            .foregroundStyle(.black)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .background(Capsule().fill(LocusTheme.accent))
+            .contentShape(Capsule())
     }
 }
 
@@ -422,7 +361,7 @@ enum SetupGate {
         UserDefaults.standard.set(false, forKey: inProgressKey)
     }
 
-    /// Already paired *during* this walkthrough → LocalDevVPN page.
+    /// Already paired *during* this walkthrough → local VPN page.
     /// Fresh install → welcome. Already-paired upgrades are handled in `LocusApp`.
     static func initialStep(hasPairingFile: Bool) -> SetupFlowView.Step {
         if hasPairingFile, isInProgress { return .vpn }

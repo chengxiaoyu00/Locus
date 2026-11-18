@@ -10,7 +10,6 @@ struct PairOnDeviceView: View {
 
     @EnvironmentObject private var pairing: PairingStore
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var scenePhase
 
     @StateObject private var host = PairOnDeviceService()
 
@@ -38,16 +37,7 @@ struct PairOnDeviceView: View {
                 scrollContent
             }
         }
-        .onChange(of: host.phase) { _, phase in
-            if case .succeeded = phase {
-                pairing.refresh()
-            }
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active, host.isBusy {
-                _ = host.pin
-            }
-        }
+        .onDisappear { host.resetToIdle() }
     }
 
     private var scrollContent: some View {
@@ -87,7 +77,7 @@ struct PairOnDeviceView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Follow these steps")
                 .font(.headline)
-            Text("Keep Locus open. You’ll leave briefly for Settings, then come back with a code.")
+            Text("Stay in Settings while pairing. Read the six-digit code in the Locus notification and enter it in the second prompt.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
         }
@@ -175,8 +165,8 @@ struct PairOnDeviceView: View {
                 Text("Paired")
                     .font(.title3.weight(.bold))
                 Text(mode == .embedded
-                     ? "Next we’ll set up LocalDevVPN."
-                     : "RPPairing file saved. Connect LocalDevVPN, then teleport.")
+                     ? "Next, connect the local VPN."
+                     : "Pairing saved. Connect the local VPN in Locus to teleport.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -243,6 +233,10 @@ struct PairOnDeviceView: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity)
                 .multilineTextAlignment(.center)
+            Button("Restart pairing") {
+                host.resetToIdle()
+                host.start(pairingStore: pairing)
+            }
         }
     }
 }

@@ -1,0 +1,77 @@
+{
+  "sourceLanguage" : "en",
+  "strings" : {
+    "Start ${applicationName} tunnel" : {
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringSet" : {
+            "state" : "new",
+            "values" : [
+              "Start ${applicationName} tunnel",
+              "Connect ${applicationName} tunnel",
+              "Enable ${applicationName} tunnel"
+            ]
+          }
+        },
+        "zh-HK" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "啟動 ${applicationName} VPN",
+              "連接 ${applicationName} VPN",
+              "啟用 ${applicationName} VPN"
+            ]
+          }
+        }
+      }
+    },
+    "Stop ${applicationName} tunnel" : {
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringSet" : {
+            "state" : "new",
+            "values" : [
+              "Stop ${applicationName} tunnel",
+              "Disconnect ${applicationName} tunnel",
+              "Disable ${applicationName} tunnel"
+            ]
+          }
+        },
+        "zh-HK" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "停止 ${applicationName} VPN",
+              "中斷 ${applicationName} VPN",
+              "停用 ${applicationName} VPN"
+            ]
+          }
+        }
+      }
+    },
+    "Toggle ${applicationName} tunnel" : {
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringSet" : {
+            "state" : "new",
+            "values" : [
+              "Toggle ${applicationName} tunnel"
+            ]
+          }
+        },
+        "zh-HK" : {
+          "stringSet" : {
+            "state" : "translated",
+            "values" : [
+              "切換 ${applicationName} VPN"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "version" : "1.1"
+}

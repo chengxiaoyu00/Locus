@@ -5,9 +5,8 @@ struct MapHomeView: View {
     @EnvironmentObject private var session: SpoofSession
     @EnvironmentObject private var pairing: PairingStore
 
-    @StateObject private var search = PlaceSearchCompleter()
+    @StateObject private var search = PlaceSearch()
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
-    @State private var searchText = ""
     @FocusState private var searchFocused: Bool
     @State private var routeStart: CLLocationCoordinate2D?
     @State private var routeEnd: CLLocationCoordinate2D?
@@ -46,6 +45,7 @@ struct MapHomeView: View {
                                 selected: pinSelected,
                                 isDragging: isDraggingPin,
                                 onSelect: {
+                                    search.dismissResults()
                                     searchFocused = false
                                     suppressNextMapTap = true
                                     withAnimation(.spring(response: 0.28, dampingFraction: 0.78)) {
@@ -66,6 +66,7 @@ struct MapHomeView: View {
                                     }
                                 },
                                 onDragBegan: {
+                                    search.dismissResults()
                                     searchFocused = false
                                     suppressNextMapTap = true
                                     pinSelected = false
@@ -106,8 +107,9 @@ struct MapHomeView: View {
                 .mapStyle(mapStyle)
                 .mapControlVisibility(.hidden)
                 .onTapGesture { point in
-                    searchFocused = false
                     guard !suppressNextMapTap, !isDraggingPin else { return }
+                    searchFocused = false
+                    search.dismissResults()
                     pinSelected = false
                     placePin(at: point, proxy: proxy)
                 }
@@ -119,6 +121,7 @@ struct MapHomeView: View {
         .onAppear {
             session.startLocationUpdates()
         }
+        .onDisappear { search.dismissResults() }
         .onChange(of: session.pin?.latitude) { _, newValue in
             if newValue == nil { pinSelected = false }
         }
@@ -167,9 +170,7 @@ struct MapHomeView: View {
 
             searchBar
 
-            if !searchText.isEmpty && !search.results.isEmpty {
-                searchResults
-            }
+            if search.showsResults { searchResults }
 
             HStack(alignment: .center, spacing: 10) {
                 mapChromeButtons
@@ -186,20 +187,24 @@ struct MapHomeView: View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
-            TextField("Search places", text: $searchText)
+            TextField("Search places", text: Binding(get: { search.text }, set: { search.edit($0) }))
+                .accessibilityIdentifier("placeSearchField")
                 .textInputAutocapitalization(.words)
                 .focused($searchFocused)
                 .submitLabel(.search)
-                .onSubmit {
-                    searchFocused = false
-                }
-                .onChange(of: searchText) { _, value in
-                    search.query = value
-                }
-            if searchFocused || !searchText.isEmpty {
+                .onSubmit { submitAddress(search.text) }
+            PasteButton(payloadType: String.self) { strings in
+                guard let address = strings.first else { return }
+                submitAddress(address)
+            }
+            .labelStyle(.titleOnly)
+            .controlSize(.small)
+            .tint(LocusTheme.accent)
+            .accessibilityLabel("Paste address")
+            .accessibilityIdentifier("pasteAddress")
+            if searchFocused || !search.text.isEmpty {
                 Button {
-                    searchText = ""
-                    search.query = ""
+                    search.clear()
                     searchFocused = false
                 } label: {
                     Image(systemName: "xmark.circle.fill")
@@ -224,27 +229,47 @@ struct MapHomeView: View {
 
     private var searchResults: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(search.results.prefix(5), id: \.self) { item in
-                Button {
-                    select(completion: item)
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
-                        if !item.subtitle.isEmpty {
-                            Text(item.subtitle).font(.caption).foregroundStyle(.secondary)
-                        }
+            switch search.results {
+            case .suggestions(let items):
+                ForEach(items.prefix(5), id: \.self) { item in
+                    searchRow(title: item.title, subtitle: item.subtitle) {
+                        search.select(item, onSelection: placeSearchPin)
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                Divider().opacity(0.3)
+            case .matches(let places):
+                ForEach(places.prefix(5), id: \.self) { place in
+                    searchRow(title: place.name ?? search.text, subtitle: place.searchAddress) {
+                        placeSearchPin(place, search.text)
+                    }
+                }
+            case .loading:
+                ProgressView("Searching…").padding(12)
+            case .emptyQuery:
+                Text("Enter an address to search.").padding(12)
+            case .noMatches:
+                Text("No places found. Try adding a city or street number.").padding(12)
+            case .unavailable:
+                Text("Search is unavailable. Please try again.").padding(12)
             }
         }
+        .font(.subheadline)
         .locusGlass(.regular, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func searchRow(title: String, subtitle: String?, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: title).font(.subheadline.weight(.semibold)).foregroundStyle(.primary)
+                if let subtitle, !subtitle.isEmpty, subtitle != title {
+                    Text(verbatim: subtitle).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var mapChromeButtons: some View {
@@ -295,6 +320,7 @@ struct MapHomeView: View {
     /// Centers on the spoofed fix while spoofing, otherwise the real GPS —
     /// never the leftover teleport pin (`.automatic` would frame that marker).
     private func goToCurrentLocation() {
+        search.dismissResults()
         let meters: CLLocationDistance = 900
         withAnimation(.easeInOut(duration: 0.35)) {
             if session.isSpoofing, let sim = session.simulated {
@@ -333,25 +359,22 @@ struct MapHomeView: View {
         .foregroundStyle(.primary)
     }
 
-    private func select(completion: MKLocalSearchCompletion) {
-        Task {
-            let request = MKLocalSearch.Request(completion: completion)
-            if let response = try? await MKLocalSearch(request: request).start(),
-               let item = response.mapItems.first {
-                let coord = item.placemark.coordinate
-                let title = item.name ?? completion.title
-                await MainActor.run {
-                    session.pin = coord
-                    pinPlaceName = title
-                    position = .region(MKCoordinateRegion(center: coord, latitudinalMeters: 1200, longitudinalMeters: 1200))
-                    searchText = ""
-                    search.query = ""
-                    searchFocused = false
-                    session.addFavorite(name: title, coordinate: coord)
-                    session.pushNamedRecent(name: title, coordinate: coord)
-                }
-            }
-        }
+    private func submitAddress(_ input: String) {
+        searchFocused = false
+        search.submit(input, onSelection: placeSearchPin)
+    }
+
+    private func placeSearchPin(_ item: MKMapItem, _ fallbackTitle: String) {
+        let coord = item.searchCoordinate
+        let title = item.name ?? fallbackTitle
+        search.clear()
+        searchFocused = false
+        pinSelected = false
+        session.pin = coord
+        pinPlaceName = title
+        position = .region(MKCoordinateRegion(center: coord, latitudinalMeters: 1200, longitudinalMeters: 1200))
+        session.addFavorite(name: title, coordinate: coord)
+        session.pushNamedRecent(name: title, coordinate: coord)
     }
 
     private func buildRoadRoute() {
@@ -425,29 +448,120 @@ private extension UIWindowScene {
     var keyWindow: UIWindow? { windows.first { $0.isKeyWindow } }
 }
 
-@MainActor
-final class PlaceSearchCompleter: NSObject, ObservableObject, MKLocalSearchCompleterDelegate {
-    @Published var results: [MKLocalSearchCompletion] = []
-    private let completer = MKLocalSearchCompleter()
+private extension MKMapItem {
+    var searchAddress: String? {
+        if #available(iOS 26.0, *) { return address?.fullAddress }
+        return placemark.title
+    }
 
-    var query: String = "" {
-        didSet {
-            completer.queryFragment = query
+    var searchCoordinate: CLLocationCoordinate2D {
+        if #available(iOS 26.0, *) { return location.coordinate }
+        return placemark.coordinate
+    }
+}
+
+@MainActor
+final class PlaceSearch: NSObject, ObservableObject, MKLocalSearchCompleterDelegate {
+    enum Results {
+        case suggestions([MKLocalSearchCompletion])
+        case loading
+        case matches([MKMapItem])
+        case emptyQuery, noMatches, unavailable
+    }
+
+    @Published private(set) var text = ""
+    @Published private(set) var results: Results = .suggestions([])
+    private var completer: MKLocalSearchCompleter?
+    private var lookup: MKLocalSearch?
+
+    var showsResults: Bool {
+        if case .suggestions(let items) = results { return !items.isEmpty }
+        return true
+    }
+
+    func edit(_ input: String) {
+        dismissResults()
+        text = input
+        guard !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let completer = MKLocalSearchCompleter()
+        self.completer = completer
+        completer.delegate = self
+        completer.resultTypes = [.address, .pointOfInterest]
+        completer.queryFragment = input
+    }
+
+    func submit(_ input: String, onSelection: @escaping (MKMapItem, String) -> Void) {
+        dismissResults()
+        text = input.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard !text.isEmpty else {
+            results = .emptyQuery
+            return
+        }
+        let request = MKLocalSearch.Request()
+        request.naturalLanguageQuery = text
+        request.resultTypes = [.address, .pointOfInterest]
+        resolve(request, title: text, chooseFirst: false, onSelection: onSelection)
+    }
+
+    func select(_ completion: MKLocalSearchCompletion, onSelection: @escaping (MKMapItem, String) -> Void) {
+        dismissResults()
+        resolve(.init(completion: completion), title: completion.title, chooseFirst: true, onSelection: onSelection)
+    }
+
+    func dismissResults() {
+        completer?.delegate = nil
+        completer?.cancel()
+        completer = nil
+        let previous = lookup
+        lookup = nil
+        previous?.cancel()
+        results = .suggestions([])
+    }
+
+    func clear() {
+        dismissResults()
+        text = ""
+    }
+
+    private func resolve(_ request: MKLocalSearch.Request, title: String, chooseFirst: Bool,
+                         onSelection: @escaping (MKMapItem, String) -> Void) {
+        let search = MKLocalSearch(request: request)
+        lookup = search
+        results = .loading
+        search.start { [weak self, weak search] response, error in
+            guard let self, let search, self.lookup === search else { return }
+            self.lookup = nil
+            if let error {
+                self.results = (error as? MKError)?.code == .placemarkNotFound ? .noMatches : .unavailable
+                return
+            }
+            let items = response?.mapItems ?? []
+            guard let first = items.first else {
+                self.results = .noMatches
+                return
+            }
+            if chooseFirst || items.count == 1 {
+                self.results = .suggestions([])
+                onSelection(first, title)
+            } else {
+                self.results = .matches(items)
+            }
         }
     }
 
-    override init() {
-        super.init()
-        completer.delegate = self
-        completer.resultTypes = [.address, .pointOfInterest]
+    nonisolated func completerDidUpdateResults(_ source: MKLocalSearchCompleter) {
+        let id = ObjectIdentifier(source)
+        Task { @MainActor in
+            guard let current = self.completer, ObjectIdentifier(current) == id else { return }
+            self.results = .suggestions(current.results)
+        }
     }
 
-    nonisolated func completerDidUpdateResults(_ completer: MKLocalSearchCompleter) {
-        let items = completer.results
-        Task { @MainActor in self.results = items }
-    }
-
-    nonisolated func completer(_ completer: MKLocalSearchCompleter, didFailWithError error: Error) {
-        Task { @MainActor in self.results = [] }
+    nonisolated func completer(_ source: MKLocalSearchCompleter, didFailWithError error: Error) {
+        let id = ObjectIdentifier(source)
+        Task { @MainActor in
+            guard let current = self.completer, ObjectIdentifier(current) == id else { return }
+            self.results = .suggestions([])
+        }
     }
 }

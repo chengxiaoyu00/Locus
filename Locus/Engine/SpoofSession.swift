@@ -82,9 +82,13 @@ final class SpoofSession: ObservableObject {
     @Published var favorites: [SavedPlace] = []
     @Published var recents: [SavedPlace] = []
 
-    private var resendTimer: Timer?
-    private var healthTimer: Timer?
-    private var joystickTimer: Timer?
+    private let engine = LocationEngine()
+    private let vpn = LocusVPN.shared
+    private var operation: Task<Void, Never>?
+    private var stopping = false
+    private var refreshTask: Task<Void, Never>?
+    private var nextRefresh = ContinuousClock.now
+    private var joystickTask: Task<Void, Never>?
     private var routeTask: Task<Void, Never>?
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
     private var joystickVector: CGVector = .zero
@@ -96,6 +100,11 @@ final class SpoofSession: ObservableObject {
     init() {
         favorites = SavedPlace.load(key: favoritesKey)
         recents = SavedPlace.load(key: recentsKey)
+        vpn.beforeDisconnect = { [weak self] in
+            guard let self, self.operation != nil || self.simulated != nil || self.routeTask != nil || self.joystickActive else { return }
+            await self.stop().value
+            if self.status.isDropped { throw LocationEngineError.locationClear }
+        }
     }
 
     var isSpoofing: Bool {
@@ -109,32 +118,54 @@ final class SpoofSession: ObservableObject {
             lastError = "Import an RPPairing file in Settings first."
             return
         }
+        guard !stopping else { return }
+        routeTask?.cancel()
         pin = coordinate
-        apply(coordinate, pairing: pairing, markRecent: true)
+        apply(coordinate, pairing: pairing, markRecent: true, connectVPN: true)
     }
 
-    func stop(pairing: PairingStore) {
+    func vpnDidDisconnect() {
+        // A failed native write can mark the session as dropped before iOS reports the disconnect.
+        guard simulated != nil, !stopping,
+              refreshTask != nil || routeTask != nil || joystickActive || operation != nil else { return }
+        stop()
+    }
+
+    @discardableResult
+    func stop() -> Task<Void, Never> {
+        if stopping, let operation { return operation }
+        stopping = true
         routeTask?.cancel()
         routeTask = nil
         stopJoystick()
-        stopResend()
-        stopHealth()
+        refreshTask?.cancel()
+        refreshTask = nil
+
+        let previous = operation
+        previous?.cancel()
         isBusy = true
-        let result = LocationEngine.clear()
-        isBusy = false
-        switch result {
-        case .success:
-            simulated = nil
-            status = .idle
+        let task = Task {
+            // A native write already in progress must finish before the final clear.
+            await previous?.value
+            let result = await engine.clear()
+            operation = nil
+            isBusy = false
+            stopping = false
             endBackground()
-            // Keep location updates running so the map puck / locate button
-            // can return to the real GPS fix (not the leftover pin).
-            locationKeeper.start()
-        case .failure(let error):
-            lastError = error.localizedDescription
-            status = .dropped(error.localizedDescription)
-            postDropNotification(error.localizedDescription)
+            switch result {
+            case .success:
+                simulated = nil
+                status = .idle
+                // Keep the map puck tracking the real GPS fix after stopping.
+                locationKeeper.start()
+            case .failure(let error):
+                lastError = error.localizedDescription
+                status = .dropped(error.localizedDescription)
+                postDropNotification(error.localizedDescription)
+            }
         }
+        operation = task
+        return task
     }
 
     /// Best-known real device coordinate (not the teleport pin).
@@ -152,19 +183,25 @@ final class SpoofSession: ObservableObject {
             lastError = "Import an RPPairing file in Settings first."
             return
         }
+        guard !stopping else { return }
         let start = simulated ?? pin ?? locationKeeper.lastKnownCoordinate
         guard let start else {
             lastError = "Drop a pin or teleport somewhere before using the joystick."
             return
         }
-        if simulated == nil {
-            apply(start, pairing: pairing, markRecent: false)
+        routeTask?.cancel()
+        if simulated == nil || vpn.status != .connected {
+            apply(start, pairing: pairing, markRecent: false, connectVPN: true)
         }
         joystickActive = true
-        joystickTimer?.invalidate()
-        joystickTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.tickJoystick(pairing: pairing)
+        joystickTask?.cancel()
+        joystickTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(250))
+                } catch { return }
+                guard let self, !Task.isCancelled else { return }
+                self.tickJoystick(pairing: pairing)
             }
         }
     }
@@ -176,23 +213,22 @@ final class SpoofSession: ObservableObject {
     func stopJoystick() {
         joystickActive = false
         joystickVector = .zero
-        joystickTimer?.invalidate()
-        joystickTimer = nil
+        joystickTask?.cancel()
+        joystickTask = nil
     }
 
     func followRoute(_ coordinates: [CLLocationCoordinate2D], pairing: PairingStore) {
-        guard pairing.hasPairingFile, coordinates.count >= 2 else { return }
+        guard !stopping, pairing.hasPairingFile, coordinates.count >= 2 else { return }
         routeTask?.cancel()
         stopJoystick()
         let mode = travelMode
         routeTask = Task { [weak self] in
-            guard let self else { return }
+            guard let self, !Task.isCancelled else { return }
             var previous = coordinates[0]
-            await MainActor.run {
-                self.apply(previous, pairing: pairing, markRecent: true)
-            }
+            await self.apply(previous, pairing: pairing, markRecent: true, connectVPN: true).value
+            guard !Task.isCancelled, self.status == .active else { return }
             for next in coordinates.dropFirst() {
-                if Task.isCancelled { break }
+                if Task.isCancelled { return }
                 let distance = CLLocation(latitude: previous.latitude, longitude: previous.longitude)
                     .distance(from: CLLocation(latitude: next.latitude, longitude: next.longitude))
                 var speed = mode.baseSpeed * Double.random(in: 0.88...1.12)
@@ -200,17 +236,18 @@ final class SpoofSession: ObservableObject {
                 let stepMeters: CLLocationDistance = min(12, max(4, speed * 0.5))
                 let steps = max(1, Int(ceil(distance / stepMeters)))
                 for i in 1...steps {
-                    if Task.isCancelled { break }
+                    if Task.isCancelled { return }
                     let t = Double(i) / Double(steps)
                     let coord = CLLocationCoordinate2D(
                         latitude: previous.latitude + (next.latitude - previous.latitude) * t,
                         longitude: previous.longitude + (next.longitude - previous.longitude) * t
                     )
                     let delay = stepMeters / speed
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                    await MainActor.run {
-                        self.apply(coord, pairing: pairing, markRecent: false)
-                    }
+                    do {
+                        try await Task.sleep(for: .seconds(delay))
+                    } catch { return }
+                    guard !Task.isCancelled else { return }
+                    await self.apply(coord, pairing: pairing, markRecent: false).value
                 }
                 previous = next
             }
@@ -287,44 +324,62 @@ final class SpoofSession: ObservableObject {
         return false
     }
 
-    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool) {
+    @discardableResult
+    private func apply(_ coordinate: CLLocationCoordinate2D, pairing: PairingStore, markRecent: Bool, connectVPN: Bool = false) -> Task<Void, Never> {
         if status == .idle || status.isDropped {
             status = .connecting
         }
         isBusy = true
-        let result = LocationEngine.set(
-            latitude: coordinate.latitude,
-            longitude: coordinate.longitude,
-            pairingPath: pairing.pairingPath,
-            deviceIP: TunnelConfig.targetIP
-        )
-        isBusy = false
-        switch result {
-        case .success:
-            simulated = coordinate
-            pin = coordinate
-            status = .active
-            lastError = nil
-            beginBackground()
-            locationKeeper.start()
-            startResend(pairing: pairing)
-            startHealth(pairing: pairing)
-            if markRecent {
-                pushRecent(coordinate)
+        let previous = operation
+        previous?.cancel()
+        let pairingPath = pairing.pairingPath
+        let task = Task {
+            await previous?.value
+            guard !Task.isCancelled else { return }
+            do {
+                // Only a user action can start the VPN. A scheduled resend must respect a disconnect.
+                if connectVPN { try await vpn.connect() }
+                try Task.checkCancellation()
+                guard vpn.status == .connected, let peer = vpn.connectedPeer else {
+                    throw LocationEngineError.vpnDisconnected
+                }
+                try await engine.set(latitude: coordinate.latitude, longitude: coordinate.longitude,
+                                     pairingPath: pairingPath, deviceIP: peer).get()
+                try Task.checkCancellation()
+                guard vpn.status == .connected else {
+                    _ = await engine.clear()
+                    throw LocationEngineError.vpnDisconnected
+                }
+                if simulated == nil { locationKeeper.start() }
+                simulated = coordinate
+                pin = coordinate
+                status = .active
+                lastError = nil
+                beginBackground()
+                nextRefresh = .now + .seconds(8)
+                startRefresh(pairing: pairing)
+                if markRecent { pushRecent(coordinate) }
+            } catch {
+                guard !Task.isCancelled else { return }
+                lastError = error.localizedDescription
+                if simulated != nil {
+                    status = .dropped(error.localizedDescription)
+                    nextRefresh = .now + .seconds(12)
+                    postDropNotification(error.localizedDescription)
+                } else {
+                    status = .idle
+                    stopJoystick()
+                }
             }
-        case .failure(let error):
-            lastError = error.localizedDescription
-            if simulated != nil {
-                status = .dropped(error.localizedDescription)
-                postDropNotification(error.localizedDescription)
-            } else {
-                status = .idle
-            }
+            operation = nil
+            isBusy = false
         }
+        operation = task
+        return task
     }
 
     private func tickJoystick(pairing: PairingStore) {
-        guard joystickActive, let current = simulated else { return }
+        guard joystickActive, !isBusy, let current = simulated else { return }
         let magnitude = hypot(joystickVector.dx, joystickVector.dy)
         guard magnitude > 0.08 else { return }
         let nx = joystickVector.dx / magnitude
@@ -336,45 +391,24 @@ final class SpoofSession: ObservableObject {
         apply(next, pairing: pairing, markRecent: false)
     }
 
-    private func startResend(pairing: PairingStore) {
-        resendTimer?.invalidate()
-        resendTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                _ = LocationEngine.set(
-                    latitude: sim.latitude,
-                    longitude: sim.longitude,
-                    pairingPath: pairing.pairingPath,
-                    deviceIP: TunnelConfig.targetIP
-                )
-            }
-        }
-    }
-
-    private func stopResend() {
-        resendTimer?.invalidate()
-        resendTimer = nil
-    }
-
-    private func startHealth(pairing: PairingStore) {
-        healthTimer?.invalidate()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self, let sim = self.simulated else { return }
-                if case .dropped = self.status {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
-                } else if !LocationEngine.isSessionActive, self.isSpoofing {
-                    self.status = .reconnecting
-                    self.apply(sim, pairing: pairing, markRecent: false)
+    private func startRefresh(pairing: PairingStore) {
+        guard refreshTask == nil else { return }
+        refreshTask = Task { [weak self] in
+            while let deadline = self?.nextRefresh {
+                do {
+                    try await Task.sleep(until: deadline, clock: .continuous)
+                } catch { return }
+                guard let self, !Task.isCancelled, let coordinate = self.simulated else { return }
+                // Movement resets the deadline. Avoid resending a previous coordinate while a write is pending.
+                if let operation = self.operation {
+                    await operation.value
+                    continue
                 }
+                guard deadline == self.nextRefresh else { continue }
+                if self.status.isDropped { self.status = .reconnecting }
+                await self.apply(coordinate, pairing: pairing, markRecent: false).value
             }
         }
-    }
-
-    private func stopHealth() {
-        healthTimer?.invalidate()
-        healthTimer = nil
     }
 
     private func pushRecent(_ coordinate: CLLocationCoordinate2D) {

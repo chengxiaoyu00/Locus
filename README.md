@@ -17,22 +17,14 @@ Free and open-source iPhone location teleport. Tap the map, search a place, or d
 - Draw a path or import / export GPX
 - Background keep-alive + live status bar + drop alerts
 - Favorites & recents
-- First-run setup walkthrough
+- First-run developer pairing and built-in local VPN setup
 - Fully on-device — no analytics, nothing uploaded
 
 ## Install
 
-See [SETUP.md](SETUP.md) for full steps. Grab a prebuilt IPA from [Releases](https://github.com/ChrisMack32/Locus/releases), or build from source below.
+Build and install Locus on an iPhone running iOS 17.6 or later. The app includes its own packet tunnel extension. See [SETUP.md](SETUP.md) for installation and pairing.
 
 Bundle ID: `com.chrismack.locus`
-
-### LiveContainer
-
-File pickers often don’t work inside LiveContainer. Use one of these:
-
-1. Long-press **Locus** → **Settings** → enable **Fix File Picker**, then try Import again.
-2. Share the pairing file **into LiveContainer → Locus**.
-3. Copy the RPPairing plist contents → in Locus use **Paste RPPairing from clipboard** (setup or Settings).
 
 ## How it works
 
@@ -40,9 +32,9 @@ Locus uses the MIT-licensed [idevice](https://github.com/jkcoxson/idevice) FFI t
 
 **iOS 27:** Settings → **Pair on this iPhone** advertises `_remotepairing-pairable-host._tcp`. Confirm the 6-digit code under Settings › Privacy & Security › Developer Mode › Pair with Host — no computer.
 
-**iOS 18–26:** import an **RPPairing** file once from [idevice_pair](https://github.com/jkcoxson/idevice_pair/releases).
+**iOS 17.6–26:** import an **RPPairing** file for this iPhone once using [idevice_pair](https://github.com/jkcoxson/idevice_pair/releases).
 
-Also install **[LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044)** (loopback tunnel, default `10.7.0.1`), then sideload Locus.
+Locus creates its own local VPN profile on first connection. Allow the iOS VPN prompt. The default device address is `10.7.0.1`. Teleport, joystick and routes wait for the VPN to connect before starting location simulation.
 
 Start a teleport on Wi‑Fi first; the session can keep working on cellular afterward.
 
@@ -58,10 +50,10 @@ Locus is for system-level teleporting. It isn’t a Pokémon GO client or an ant
 
 ## Build
 
-Building from source needs an Apple Developer account (free or paid) for code signing. The published IPA does **not** — just sideload it.
+To install the integrated build on an iPhone, sign the app and its embedded `TunnelProv` extension with provisioning profiles that include the Packet Tunnel capability. Install the app directly on the device so iOS can register the extension. [Apple’s Network Extensions configuration guide](https://developer.apple.com/documentation/xcode/configuring-network-extensions/)
 
 1. Install [XcodeGen](https://github.com/yonaskolb/XcodeGen) if needed: `brew install xcodegen`
-2. Set your **Team ID** in `project.yml` (`DEVELOPMENT_TEAM`), *or* pick your team under Xcode → Signing & Capabilities after generating the project.
+2. In `project.yml`, set the project-level `DEVELOPMENT_TEAM` and `LOCUS_BUNDLE_IDENTIFIER` to values registered to your team. The extension uses the same Team ID and appends `.TunnelProv` to the bundle identifier. For an upgrade, reuse the existing Locus bundle identifier and team to retain its pairing file and saved places.
 3. Generate and open:
 
 ```bash
@@ -79,4 +71,6 @@ xcodebuild -project Locus.xcodeproj -scheme Locus -configuration Release \
 
 ## License
 
-MIT. `Vendor/idevice` contains the idevice FFI (MIT). Locus is an independent open-source project and is not affiliated with Mirage / Wapixel.
+Locus and the vendored idevice FFI use the MIT license. Locus is an independent open-source project and is not affiliated with Mirage / Wapixel.
+
+The built-in VPN uses code from LocalDevVPN (StosVPN) by Stossy11, the SideStore Team and contributors. This includes the packet tunnel provider and address validation. Copyright © 2025 SideStore Team. [LocalDevVPN license](Vendor/LocalDevVPN/LocalDevVPN-LICENSE.txt)

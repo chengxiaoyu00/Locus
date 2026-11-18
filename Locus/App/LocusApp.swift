@@ -4,6 +4,9 @@ import SwiftUI
 struct LocusApp: App {
     @StateObject private var session = SpoofSession()
     @StateObject private var pairing = PairingStore()
+    @StateObject private var vpn = LocusVPN.shared
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var checkedAutoConnect = false
     @AppStorage(SetupGate.defaultsKey) private var setupComplete = false
 
     /// Map when setup finished, or when already paired outside this walkthrough.
@@ -25,7 +28,22 @@ struct LocusApp: App {
             }
             .environmentObject(session)
             .environmentObject(pairing)
+            .environmentObject(vpn)
             .preferredColorScheme(.dark)
+            .task(id: scenePhase) {
+                guard scenePhase == .active else { return }
+                await vpn.refresh()
+                guard !Task.isCancelled, !checkedAutoConnect else { return }
+                checkedAutoConnect = true
+                if UserDefaults.standard.bool(forKey: LocusVPN.autoConnectKey), vpn.status == .disconnected {
+                    try? await vpn.connect()
+                }
+            }
+            .onChange(of: vpn.status) { _, status in
+                if status == .disconnected || status == .invalid {
+                    session.vpnDidDisconnect()
+                }
+            }
             .onOpenURL { url in
                 handleIncoming(url)
             }

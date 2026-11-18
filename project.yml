@@ -2,7 +2,7 @@ name: Locus
 options:
   bundleIdPrefix: com.chrismack
   deploymentTarget:
-    iOS: "18.0"
+    iOS: "17.6"
   xcodeVersion: "16.0"
   createIntermediateGroups: true
   # Icon Composer packages must be treated as a single file, not exploded.
@@ -12,10 +12,15 @@ options:
 settings:
   base:
     # Set your Apple Developer Team ID to build from source (see README).
-    DEVELOPMENT_TEAM: ""
+    DEVELOPMENT_TEAM: 83J3HQ3CCG
+    LOCUS_BUNDLE_IDENTIFIER: com.chrismack.locus
+    MARKETING_VERSION: "1.0.2"
+    CURRENT_PROJECT_VERSION: "3"
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_EMIT_LOC_STRINGS: YES
     SWIFT_VERSION: "5.0"
     TARGETED_DEVICE_FAMILY: "1,2"
-    IPHONEOS_DEPLOYMENT_TARGET: "18.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.6"
 targets:
   Locus:
     type: application
@@ -29,22 +34,30 @@ targets:
         buildPhase: none
       - path: Vendor/idevice/idevice.h
         buildPhase: none
+      - path: Vendor/LocalDevVPN
+    dependencies:
+      - target: TunnelProv
+        embed: true
+    preBuildScripts:
+      - name: Expand idevice archive
+        inputFiles:
+          - "$(SRCROOT)/Vendor/idevice/libidevice_ffi.a.gz"
+        outputFiles:
+          - "$(DERIVED_FILE_DIR)/libidevice_ffi.a"
+        script: |
+          /usr/bin/gunzip -c "$SCRIPT_INPUT_FILE_0" > "$SCRIPT_OUTPUT_FILE_0" || { /bin/rm -f "$SCRIPT_OUTPUT_FILE_0"; exit 1; }
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.chrismack.locus
+        PRODUCT_BUNDLE_IDENTIFIER: $(LOCUS_BUNDLE_IDENTIFIER)
         PRODUCT_NAME: Locus
-        MARKETING_VERSION: "1.0.2"
-        CURRENT_PROJECT_VERSION: "3"
         INFOPLIST_FILE: Locus/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Locus/Resources/Locus.entitlements
-        CODE_SIGN_STYLE: Automatic
-        DEVELOPMENT_TEAM: ""
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: false
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"
         LIBRARY_SEARCH_PATHS:
           - "$(inherited)"
-          - "$(PROJECT_DIR)/Vendor/idevice"
+          - "$(DERIVED_FILE_DIR)"
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-lidevice_ffi"
@@ -60,3 +73,20 @@ targets:
         ENABLE_BITCODE: NO
         SUPPORTS_MACCATALYST: NO
         SWIFT_OBJC_BRIDGING_HEADER: ""
+  TunnelProv:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: TunnelProv
+        excludes:
+          - Info.plist
+      - path: Vendor/LocalDevVPN
+        includes:
+          - "*.swift"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(LOCUS_BUNDLE_IDENTIFIER).TunnelProv
+        INFOPLIST_FILE: TunnelProv/Info.plist
+        CODE_SIGN_ENTITLEMENTS: TunnelProv/TunnelProv.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES

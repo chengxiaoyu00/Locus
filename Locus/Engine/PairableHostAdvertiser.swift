@@ -1,175 +1,128 @@
+import Darwin
+import dnssd
 import Foundation
 import Network
 
-/// Public-facing pairable-host listener.
-///
-/// Uses Network.framework `NWListener` + Bonjour (what iOS 27 Developer Mode
-/// browses). Inbound connections are relayed to the Rust pairable-host on
-/// 127.0.0.1 so accept() still completes while Settings is in the foreground.
+/// A connected descriptor remains owned until both the UI and the native handshake release it.
+final class PairingSocket: Sendable {
+    let descriptor: Int32
+
+    init(_ descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    func interrupt() {
+        _ = shutdown(descriptor, SHUT_RDWR)
+    }
+
+    deinit { close(descriptor) }
+}
+
+@MainActor
 final class PairableHostAdvertiser {
-    private var listener: NWListener?
-    private var activeRelay: RelayPipe?
-    private(set) var publishedPort: UInt16 = 0
-    private var rustLoopbackPort: UInt16 = 0
+    private var listener: DispatchSourceRead?
+    private var registration: DNSServiceRef?
+    private var onFailure: ((String) -> Void)?
 
     func publish(
-        port: UInt16,
-        serviceIdentifier: String,
-        name: String,
-        model: String,
-        authTag: String,
-        ver: String,
-        minVer: String
-    ) {
+        service: String, records: [String: String],
+        onConnection: @escaping (PairingSocket) -> Void,
+        onFailure: @escaping (String) -> Void
+    ) throws {
         stop()
-        rustLoopbackPort = port
-
-        var txt = NWTXTRecord()
-        txt["name"] = name
-        txt["identifier"] = serviceIdentifier
-        txt["authTag"] = authTag
-        txt["model"] = model
-        txt["flags"] = "1"
-        txt["ver"] = ver
-        txt["minVer"] = minVer
+        let fd = socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        source.setCancelHandler { close(fd) }
+        source.setEventHandler { [weak self] in
+            guard let self, self.listener?.handle == UInt(fd) else { return }
+            let peer = accept(fd, nil, nil)
+            if peer >= 0 {
+                // The paired peer keeps its socket, and Settings can still discover the host until pair-setup finishes.
+                self.stopAccepting()
+                onConnection(PairingSocket(peer))
+            } else if errno != EWOULDBLOCK && errno != EINTR {
+                let message = POSIXError(.init(rawValue: errno) ?? .EIO).localizedDescription
+                self.stop()
+                onFailure(message)
+            }
+        }
+        listener = source
+        self.onFailure = onFailure
+        source.activate()
 
         do {
-            let parameters = NWParameters.tcp
-            parameters.allowLocalEndpointReuse = true
-            parameters.includePeerToPeer = true
-
-            let listener = try NWListener(using: parameters)
-            listener.service = NWListener.Service(
-                name: serviceIdentifier,
-                type: "_remotepairing-pairable-host._tcp",
-                domain: "local",
-                txtRecord: txt
-            )
-
-            listener.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    let p = listener.port?.rawValue ?? 0
-                    self?.publishedPort = p
-                    NSLog("[Locus] NWListener ready on port %u (relay → 127.0.0.1:%u)", p, port)
-                case .failed(let error):
-                    NSLog("[Locus] NWListener failed: %@", String(describing: error))
-                case .cancelled:
-                    NSLog("[Locus] NWListener cancelled")
-                default:
-                    break
+            var dualStack: Int32 = 0
+            var address = sockaddr_in6()
+            address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            address.sin6_family = sa_family_t(AF_INET6)
+            var length = socklen_t(address.sin6_len)
+            guard setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &dualStack, socklen_t(MemoryLayout.size(ofValue: dualStack))) == 0,
+                  fcntl(fd, F_SETFL, O_NONBLOCK) == 0 else {
+                throw POSIXError(.init(rawValue: errno) ?? .EIO)
+            }
+            let bound = withUnsafeMutablePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    bind(fd, $0, length) == 0 && listen(fd, 1) == 0 && getsockname(fd, $0, &length) == 0
                 }
             }
-
-            listener.newConnectionHandler = { [weak self] connection in
-                NSLog(
-                    "[Locus] NWListener accepted %@",
-                    String(describing: connection.endpoint)
+            guard bound else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+            let txt = NWTXTRecord(records).data
+            let error = txt.withUnsafeBytes { buffer in
+                DNSServiceRegister(
+                    &registration, DNSServiceFlags(kDNSServiceFlagsIncludeP2P), 0, service,
+                    "_remotepairing-pairable-host._tcp", "local.", nil, address.sin6_port,
+                    UInt16(buffer.count), buffer.baseAddress, pairingRegistrationCallback,
+                    Unmanaged.passUnretained(self).toOpaque()
                 )
-                self?.relay(connection)
             }
-
-            listener.start(queue: .global(qos: .userInitiated))
-            self.listener = listener
-            NSLog("[Locus] NWListener starting; will relay → 127.0.0.1:%u", port)
+            guard error == kDNSServiceErr_NoError, let registration else {
+                throw Self.bonjourError(error)
+            }
+            let scheduleError = DNSServiceSetDispatchQueue(registration, .main)
+            guard scheduleError == kDNSServiceErr_NoError else { throw Self.bonjourError(scheduleError) }
         } catch {
-            NSLog("[Locus] NWListener start failed: %@", error.localizedDescription)
+            stop()
+            throw error
         }
     }
 
     func stop() {
-        activeRelay?.cancel()
-        activeRelay = nil
+        if let registration { DNSServiceRefDeallocate(registration) }
+        registration = nil
+        stopAccepting()
+        onFailure = nil
+    }
+
+    private func stopAccepting() {
         listener?.cancel()
         listener = nil
     }
 
-    private func relay(_ inbound: NWConnection) {
-        activeRelay?.cancel()
-        let rustPort = rustLoopbackPort
-        guard rustPort > 0, let nwPort = NWEndpoint.Port(rawValue: rustPort) else {
-            inbound.cancel()
-            return
+    fileprivate func registrationDidReply(_ identifier: UInt, error: DNSServiceErrorType) {
+        guard let registration, identifier == UInt(bitPattern: registration), let onFailure else { return }
+        if error == kDNSServiceErr_NoError {
+            NSLog("[Locus pairing] Bonjour published")
+        } else {
+            NSLog("[Locus pairing] Bonjour registration failed (code %d)", error)
+            stop()
+            onFailure(Self.bonjourError(error).localizedDescription)
         }
+    }
 
-        let outbound = NWConnection(
-            host: NWEndpoint.Host("127.0.0.1"),
-            port: nwPort,
-            using: .tcp
-        )
-        let pipe = RelayPipe(inbound: inbound, outbound: outbound)
-        activeRelay = pipe
-        pipe.start()
+    private static func bonjourError(_ code: DNSServiceErrorType) -> NSError {
+        NSError(domain: "Bonjour", code: Int(code), userInfo: [
+            NSLocalizedDescriptionKey: "Could not advertise pairing with Bonjour (\(code))."
+        ])
     }
 }
 
-/// Bidirectional byte pump between Developer Mode and the Rust loopback listener.
-private final class RelayPipe {
-    private let inbound: NWConnection
-    private let outbound: NWConnection
-    private let queue = DispatchQueue(label: "locus.pairable.relay")
-
-    init(inbound: NWConnection, outbound: NWConnection) {
-        self.inbound = inbound
-        self.outbound = outbound
-    }
-
-    func start() {
-        inbound.stateUpdateHandler = { [weak self] state in
-            if case .failed = state { self?.cancel() }
-            if case .cancelled = state { self?.cancel() }
-        }
-        outbound.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                NSLog("[Locus] relay connected to Rust loopback")
-                self.pump(from: self.inbound, to: self.outbound)
-                self.pump(from: self.outbound, to: self.inbound)
-            case .failed(let error):
-                NSLog("[Locus] relay to Rust failed: %@", String(describing: error))
-                self.cancel()
-            case .cancelled:
-                self.cancel()
-            default:
-                break
-            }
-        }
-        inbound.start(queue: queue)
-        outbound.start(queue: queue)
-    }
-
-    func cancel() {
-        inbound.cancel()
-        outbound.cancel()
-    }
-
-    private func pump(from: NWConnection, to: NWConnection) {
-        from.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let error {
-                NSLog("[Locus] relay receive error: %@", String(describing: error))
-                self.cancel()
-                return
-            }
-            if let data, !data.isEmpty {
-                to.send(content: data, completion: .contentProcessed { sendError in
-                    if let sendError {
-                        NSLog("[Locus] relay send error: %@", String(describing: sendError))
-                        self.cancel()
-                        return
-                    }
-                    if isComplete {
-                        self.cancel()
-                    } else {
-                        self.pump(from: from, to: to)
-                    }
-                })
-            } else if isComplete {
-                self.cancel()
-            } else {
-                self.pump(from: from, to: to)
-            }
-        }
+private let pairingRegistrationCallback: DNSServiceRegisterReply = { ref, _, error, _, _, _, context in
+    guard let context, let ref else { return }
+    let advertiser = Unmanaged<PairableHostAdvertiser>.fromOpaque(context).takeUnretainedValue()
+    let identifier = UInt(bitPattern: ref)
+    // DNSServiceSetDispatchQueue registers this callback on the main queue.
+    MainActor.assumeIsolated {
+        advertiser.registrationDidReply(identifier, error: error)
     }
 }

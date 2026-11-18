@@ -2,6 +2,7 @@ import Foundation
 import idevice
 
 enum LocationEngineError: LocalizedError {
+    case vpnDisconnected
     case invalidIP
     case pairingRead
     case tunnelCreate
@@ -9,74 +10,45 @@ enum LocationEngineError: LocalizedError {
     case simulationCreate
     case locationSet
     case locationClear
-    case notActive
 
     var errorDescription: String? {
         switch self {
-        case .invalidIP: return "Tunnel IP is invalid. Check Settings → Tunnel IP (usually 10.7.0.1)."
+        case .vpnDisconnected: return String(localized: "The Locus VPN is disconnected. Connect it in Settings and try again.")
+        case .invalidIP: return String(localized: "The device IP is invalid. Check the VPN addresses in Locus Settings.")
         case .pairingRead: return "Could not read the RPPairing file. Generate one with idevice_pair in RPPairing mode."
-        case .tunnelCreate: return "Could not open the developer tunnel. Is LocalDevVPN connected on Wi‑Fi?"
+        case .tunnelCreate: return String(localized: "The VPN connected, but the developer tunnel could not open. Check Wi-Fi and the pairing file for this iPhone.")
         case .remoteServer: return "Connected to the tunnel but RemoteXPC handshake failed."
         case .simulationCreate: return "Could not open Apple’s location simulation service."
         case .locationSet: return "Failed to set simulated coordinates."
         case .locationClear: return "Failed to clear simulated location."
-        case .notActive: return "No active simulation session."
-        }
-    }
-
-    static func from(code: Int32) -> LocationEngineError {
-        switch code {
-        case 1: return .invalidIP
-        case 2: return .pairingRead
-        case 3: return .tunnelCreate
-        case 9: return .remoteServer
-        case 10: return .simulationCreate
-        case 11: return .locationSet
-        case 12: return .locationClear
-        default: return .locationSet
         }
     }
 }
 
 /// Thin Swift wrapper around idevice’s DVT location simulation (injects into locationd).
-enum LocationEngine {
-    private static let queue = DispatchQueue(label: "com.chrismack.locus.location", qos: .userInitiated)
+actor LocationEngine {
+    // The native calls block, so give them a serial queue independent of the UI and cooperative pool.
+    private nonisolated let queue = DispatchSerialQueue(label: "com.chrismack.locus.location", qos: .userInitiated)
+    nonisolated var unownedExecutor: UnownedSerialExecutor { queue.asUnownedSerialExecutor() }
 
-    private static var adapter: OpaquePointer?
-    private static var handshake: OpaquePointer?
-    private static var remoteServer: OpaquePointer?
-    private static var locationSimulation: OpaquePointer?
+    private var adapter: OpaquePointer?
+    private var handshake: OpaquePointer?
+    private var remoteServer: OpaquePointer?
+    private var locationSimulation: OpaquePointer?
 
-    private static let ok: Int32 = 0
-    private static let invalidIP: Int32 = 1
-    private static let pairingRead: Int32 = 2
-    private static let tunnelCreate: Int32 = 3
-    private static let remoteServerCode: Int32 = 9
-    private static let simulationCreate: Int32 = 10
-    private static let locationSet: Int32 = 11
-    private static let locationClear: Int32 = 12
-
-    static var isSessionActive: Bool { locationSimulation != nil }
-
-    static func set(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Result<Void, LocationEngineError> {
-        var result: Result<Void, LocationEngineError> = .failure(.locationSet)
-        queue.sync {
-            let code = setLocked(latitude: latitude, longitude: longitude, pairingPath: pairingPath, deviceIP: deviceIP)
-            result = code == ok ? .success(()) : .failure(.from(code: code))
+    func clear() -> Result<Void, LocationEngineError> {
+        guard let locationSimulation else { return .success(()) }
+        if let error = location_simulation_clear(locationSimulation) {
+            // Keep the handles for a retry while the VPN is still available.
+            idevice_error_free(error)
+            return .failure(.locationClear)
         }
-        return result
+        cleanup()
+        return .success(())
     }
 
-    static func clear() -> Result<Void, LocationEngineError> {
-        var result: Result<Void, LocationEngineError> = .failure(.notActive)
-        queue.sync {
-            let code = clearLocked()
-            result = code == ok ? .success(()) : .failure(.from(code: code))
-        }
-        return result
-    }
-
-    private static func cleanup() {
+    private func cleanup() {
+        // The simulation borrows the remote server until location_simulation_free.
         if let locationSimulation {
             location_simulation_free(locationSimulation)
             self.locationSimulation = nil
@@ -95,30 +67,33 @@ enum LocationEngine {
         }
     }
 
-    private static func setLocked(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Int32 {
+    func set(latitude: Double, longitude: Double, pairingPath: String, deviceIP: String) -> Result<Void, LocationEngineError> {
         if let locationSimulation {
             if let err = location_simulation_set(locationSimulation, latitude, longitude) {
                 idevice_error_free(err)
                 cleanup()
             } else {
-                return ok
+                return .success(())
             }
         }
 
         var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         address.sin_family = sa_family_t(AF_INET)
         address.sin_port = in_port_t(49152).bigEndian
         let inetResult = deviceIP.withCString { inet_pton(AF_INET, $0, &address.sin_addr) }
-        guard inetResult == 1 else { return invalidIP }
+        guard inetResult == 1 else { return .failure(.invalidIP) }
 
         var pairingHandle: OpaquePointer?
         if let pairingError = pairingPath.withCString({ rp_pairing_file_read($0, &pairingHandle) }) {
             idevice_error_free(pairingError)
-            return pairingRead
+            return .failure(.pairingRead)
         }
-        guard let pairingHandle else { return pairingRead }
+        guard let pairingHandle else { return .failure(.pairingRead) }
         defer { rp_pairing_file_free(pairingHandle) }
 
+        var newAdapter: OpaquePointer?
+        var newHandshake: OpaquePointer?
         let providerError = withUnsafePointer(to: &address) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 tunnel_create_rppairing(
@@ -128,47 +103,35 @@ enum LocationEngine {
                     pairingHandle,
                     nil,
                     nil,
-                    &adapter,
-                    &handshake
+                    &newAdapter,
+                    &newHandshake
                 )
             }
         }
+        adapter = newAdapter
+        handshake = newHandshake
         if let providerError {
             idevice_error_free(providerError)
             cleanup()
-            return tunnelCreate
+            return .failure(.tunnelCreate)
         }
 
         if let remoteServerError = remote_server_connect_rsd(adapter, handshake, &remoteServer) {
             idevice_error_free(remoteServerError)
             cleanup()
-            return remoteServerCode
+            return .failure(.remoteServer)
         }
 
         if let simError = location_simulation_new(remoteServer, &locationSimulation) {
             idevice_error_free(simError)
             cleanup()
-            return simulationCreate
+            return .failure(.simulationCreate)
         }
-        // location_simulation_new consumes/owns remote server lifecycle alongside handle
-        remoteServer = nil
-
         if let setError = location_simulation_set(locationSimulation, latitude, longitude) {
             idevice_error_free(setError)
             cleanup()
-            return locationSet
+            return .failure(.locationSet)
         }
-        return ok
-    }
-
-    private static func clearLocked() -> Int32 {
-        guard let locationSimulation else { return locationClear }
-        let err = location_simulation_clear(locationSimulation)
-        cleanup()
-        if let err {
-            idevice_error_free(err)
-            return locationClear
-        }
-        return ok
+        return .success(())
     }
 }

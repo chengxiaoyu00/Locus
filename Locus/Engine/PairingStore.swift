@@ -6,6 +6,7 @@ import UIKit
 final class PairingStore: ObservableObject {
     @Published private(set) var hasPairingFile = false
     @Published var lastError: String?
+    private(set) var revision = UUID()
 
     static let fileName = "rp_pairing_file.plist"
     static let supportedTypes: [UTType] = {
@@ -83,20 +84,24 @@ final class PairingStore: ObservableObject {
         if FileManager.default.fileExists(atPath: pairingURL.path) {
             try FileManager.default.removeItem(at: pairingURL)
         }
+        revision = UUID()
         hasPairingFile = false
     }
 
-    private func installPairingData(_ data: Data) throws {
+    func installPairingData(_ data: Data) throws {
         guard looksLikePairingPlist(data) else {
             throw PairingImportError.invalidContents
         }
 
         try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
-        if FileManager.default.fileExists(atPath: pairingURL.path) {
-            try FileManager.default.removeItem(at: pairingURL)
+        let staged = directoryURL.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: staged) }
+        try data.write(to: staged, options: .withoutOverwriting)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: staged.path)
+        guard rename(staged.path, pairingURL.path) == 0 else {
+            throw POSIXError(.init(rawValue: errno) ?? .EIO)
         }
-        try data.write(to: pairingURL, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pairingURL.path)
+        revision = UUID()
         hasPairingFile = true
         lastError = nil
     }

@@ -1,5 +1,4 @@
 import SwiftUI
-import NetworkExtension
 
 struct RootView: View {
     @EnvironmentObject private var session: SpoofSession
@@ -39,119 +38,49 @@ struct RootView: View {
 
 struct StatusBarView: View {
     @EnvironmentObject private var session: SpoofSession
-    @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var vpn: LocusVPN
 
-    @State private var tunnelConnected = LocalDevVPN.isConnected
-
-    private enum Display {
-        case notSpoofing
-        case connectVPN
-        case status(String)
-    }
-
-    private var display: Display {
+    private var simulationTitle: LocalizedStringKey {
         switch session.status {
-        case .idle:
-            return tunnelConnected ? .notSpoofing : .connectVPN
-        case .connecting:
-            return .status("Connecting…")
-        case .active:
-            return .status("Spoofing")
-        case .reconnecting:
-            return .status("Reconnecting…")
-        case .dropped(let reason):
-            return .status(reason.isEmpty ? "Disconnected" : "Disconnected — \(reason)")
-        }
-    }
-
-    private var color: Color {
-        switch display {
-        case .notSpoofing:
-            return Color.primary.opacity(0.55)
-        case .connectVPN:
-            return LocusTheme.statusWarn
-        case .status:
-            switch session.status {
-            case .active: return LocusTheme.statusGood
-            case .connecting, .reconnecting: return LocusTheme.statusWarn
-            case .dropped: return LocusTheme.statusBad
-            case .idle: return Color.primary.opacity(0.55)
-            }
-        }
-    }
-
-    private var title: String {
-        switch display {
-        case .notSpoofing: return "Not Spoofing"
-        case .connectVPN: return "Connect LocalDevVPN"
-        case .status(let text): return text
+        case .idle: return "Location idle"
+        case .connecting: return "Starting simulation…"
+        case .active: return "Simulating location"
+        case .reconnecting: return "Reconnecting simulation…"
+        case .dropped: return "Simulation interrupted"
         }
     }
 
     var body: some View {
-        Group {
-            if case .connectVPN = display {
-                Button(action: LocalDevVPN.openOrInstall) {
-                    statusContent
-                }
-                .buttonStyle(.plain)
-            } else {
-                statusContent
-            }
-        }
-        .onAppear { refreshTunnel() }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active { refreshTunnel() }
-        }
-        .onChange(of: session.status) { _, _ in
-            refreshTunnel()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)) { _ in
-            // LocalDevVPN connection changes show up here even though we don’t own the VPN.
-            refreshTunnel()
-        }
-        .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                refreshTunnel()
-            }
-        }
-    }
-
-    private var statusContent: some View {
         HStack(spacing: 10) {
-            Circle()
-                .fill(color)
-                .frame(width: 8, height: 8)
-                .shadow(color: color.opacity(0.7), radius: 4)
-
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
-
-            Spacer(minLength: 8)
-
-            if case .connectVPN = display {
-                Image(systemName: "lock.shield.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(LocusTheme.accent)
-            } else if case .active = session.status, let sim = session.simulated {
-                Text(String(format: "%.4f, %.4f", sim.latitude, sim.longitude))
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
+            if vpn.status.locusCanConnect {
+                VPNActionButton(action: vpn.connect) {
+                    Label("Connect VPN", systemImage: "lock.shield")
+                }
+                .foregroundStyle(LocusTheme.accent)
+            } else {
+                Label {
+                    Text("VPN · \(Text(vpn.status.locusTitle))")
+                } icon: {
+                    Image(systemName: "lock.shield")
+                }
+                .accessibilityLabel(Text("Local VPN"))
+                .accessibilityValue(Text(vpn.status.locusTitle))
             }
+            Spacer(minLength: 4)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(simulationTitle)
+                if case .active = session.status, let sim = session.simulated {
+                    Text(verbatim: String(format: "%.4f, %.4f", sim.latitude, sim.longitude))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .accessibilityElement(children: .combine)
         }
+        .font(.subheadline.weight(.semibold))
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .locusGlass(.clear, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-
-    private func refreshTunnel() {
-        tunnelConnected = LocalDevVPN.isConnected
     }
 }
 
@@ -220,9 +149,9 @@ struct BottomControlsView: View {
                 }
                 .buttonStyle(.plain)
 
-                if session.isSpoofing {
+                if session.isSpoofing || (session.status.isDropped && session.simulated != nil) {
                     Button {
-                        session.stop(pairing: pairing)
+                        session.stop()
                     } label: {
                         Text("Stop")
                             .font(.subheadline.weight(.bold))

@@ -1,18 +1,12 @@
 # Locus — install & first teleport
 
-## 1. Sideload the IPA
+## 1. Install Locus
 
-Install the latest IPA from [Releases](https://github.com/ChrisMack32/Locus/releases) (or build from source) with Feather, SideStore, AltStore, Sideloadly, or LiveContainer.
+Build this checkout and install the **Locus** target directly on an iPhone running iOS 17.6 or later. The signed app must include its signed `PlugIns/TunnelProv.appex` extension. Both signing profiles need the Network Extensions packet tunnel entitlement. [Build instructions](README.md#build)
 
 Bundle ID: `com.chrismack.locus`
 
-### LiveContainer
-
-File pickers often break inside LiveContainer. Do one of the following:
-
-1. Long-press **Locus** in LiveContainer → **Settings** → enable **Fix File Picker**, then try Import again.
-2. Share / open the pairing file **into LiveContainer → Locus** (iOS share sheet).
-3. Copy the RPPairing plist contents, open Locus → **Paste RPPairing from clipboard** (setup or Settings).
+If you already use Locus with the standalone LocalDevVPN app, stop the current simulation and disconnect the old VPN. An in-place update with the same app identifier and team keeps Locus’s saved pairing file and favorites. Connect the built-in VPN once to authorize the new Locus profile.
 
 ## 2. Pairing
 
@@ -23,20 +17,20 @@ File pickers often break inside LiveContainer. Do one of the following:
 3. Leave Locus open. Go to **Settings › Privacy & Security › Developer Mode › Pair with Host**.
 4. Pick **Locus** → **Pair**.
 5. Enter your **iPhone unlock passcode** first (authorizes pairing).
-6. When the second prompt appears, type the **6-digit code** Locus shows (also sent as a notification).
-7. Done — RPPairing file is saved on-device.
+6. Stay in Settings. Read the **6-digit code** from the Locus notification banner and enter it in the second prompt.
+7. Return to Locus and check for **Paired**. If Settings reports an interrupted connection, choose **Restart pairing** in Locus and use the new attempt’s code.
 
-### On iOS 18–26
+### On iOS 17.6–26
 
 1. On a computer, download [idevice_pair](https://github.com/jkcoxson/idevice_pair/releases).
 2. Plug in your iPhone, unlock, Trust.
 3. Generate an **RPPairing** file (not lockdown / SideStore `.mobiledevicepairing`).
 4. AirDrop / Share → Open in **Locus**, **Import**, or **Paste from clipboard**.
 
-## 3. LocalDevVPN
+## 3. Connect the built-in VPN
 
-Install [LocalDevVPN](https://apps.apple.com/us/app/localdevvpn/id6755608044), connect it (default tunnel IP `10.7.0.1`).
+Tap **Connect VPN** in the VPN setup step or in Locus Settings. Approve the iOS request to add a VPN configuration. When Locus reports **Connected**, the system tunnel is ready. With the default settings, the device address is `10.7.0.1` and the VPN interface address is `10.7.1.1`.
 
 ## 4. Teleport
 
-On Wi‑Fi: drop a pin → **Teleport**. Then joystick / routes / GPX work; the session can continue on cellular.
+Connect to Wi-Fi, drop a pin on the map and tap **Teleport**. Check your current location in Apple Maps. **Stop** ends the location simulation. You can disconnect the VPN separately in Locus Settings.
